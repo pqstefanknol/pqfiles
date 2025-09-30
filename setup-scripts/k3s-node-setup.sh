@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# Download the script
+# wget -O k3s-node-setup.sh https://raw.githubusercontent.com/pqstefanknol/pqfiles/main/setup-scripts/k3s-node-setup.sh
+# Make it executable
+# chmod +x k3s-node-setup.sh
+# Run interactively
+# sudo ./k3s-node-setup.sh
+
 # k3s-node-setup.sh
 # Debian 12 node prep + optional k3s (HA-ready) install.
 # - Interactive prompts by default
@@ -268,7 +275,7 @@ EOF
   if [ "${ROLE}" = "server" ]; then
     if [ "${CLUSTER_INIT:-}" = "true" ]; then
       # First control-plane: embedded etcd, no join token needed yet
-      export INSTALL_K3S_EXEC="server --cluster-init --write-kubeconfig-mode=0644 --disable traefik"
+      export INSTALL_K3S_EXEC="server --cluster-init --write-kubeconfig-mode=0644 --disable traefik --tls-san ${API_VIP:-}"
       curl -sfL "${K3S_INSTALL_SH_URL}" | sh -s -
     else
       # Join another server
@@ -278,7 +285,7 @@ EOF
       fi
       export K3S_URL="${SERVER_URL}"
       export K3S_TOKEN="${TOKEN}"
-      export INSTALL_K3S_EXEC="server --write-kubeconfig-mode=0644 --disable traefik"
+      export INSTALL_K3S_EXEC="server --write-kubeconfig-mode=0644 --disable traefik --tls-san ${API_VIP:-}"
       curl -sfL "${K3S_INSTALL_SH_URL}" | sh -s -
     fi
     systemctl enable --now k3s
