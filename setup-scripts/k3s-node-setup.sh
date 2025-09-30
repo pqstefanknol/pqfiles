@@ -311,15 +311,15 @@ cat <<'EONOTE'
 
 Next steps (HA control-plane):
 1) On first server:
-     ROLE=server CLUSTER_INIT=true HOSTNAME=server-1 ./k3s-node-setup.sh --yes
+     sudo ROLE=server CLUSTER_INIT=true HOSTNAME=server-1 ./k3s-node-setup.sh --yes
    Then retrieve the join token:
      sudo cat /var/lib/rancher/k3s/server/node-token
 
 2) On additional servers:
-     ROLE=server CLUSTER_INIT=false SERVER_URL=https://<API-VIP>:6443 TOKEN=<token> HOSTNAME=server-2 ./k3s-node-setup.sh --yes
+     sudo ROLE=server CLUSTER_INIT=false SERVER_URL=https://<API-VIP>:6443 TOKEN=<token> HOSTNAME=server-2 ./k3s-node-setup.sh --yes
 
 3) On agents (workers):
-     ROLE=agent SERVER_URL=https://<API-VIP>:6443 TOKEN=<token> HOSTNAME=worker-1 ./k3s-node-setup.sh --yes
+     sudo ROLE=agent SERVER_URL=https://<API-VIP>:6443 TOKEN=<token> HOSTNAME=worker-1 ./k3s-node-setup.sh --yes
 
 VIP & Ingress:
 - For a single API VIP on control-plane nodes, consider kube-vip (ARP) as a static pod.
