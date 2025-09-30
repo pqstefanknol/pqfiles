@@ -310,7 +310,7 @@ fi
 cat <<'EONOTE'
 
 Next steps (HA control-plane):
-1) On first server:
+1) On first server, if not set up:
      sudo ROLE=server CLUSTER_INIT=true HOSTNAME=server-1 ./k3s-node-setup.sh --yes
    Then retrieve the join token:
      sudo cat /var/lib/rancher/k3s/server/node-token
