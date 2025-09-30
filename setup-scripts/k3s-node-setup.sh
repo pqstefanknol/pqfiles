@@ -93,6 +93,33 @@ done
 ########################
 need_root
 
+# OFFLINE bundle support
+# Usage at deploy time:
+#   scp k3s-offline-...tar.gz <node>:/root/
+#   ssh <node> "sudo ./k3s-node-setup.sh --yes OFFLINE_BUNDLE=/root/k3s-offline-...tar.gz ROLE=server CLUSTER_INIT=true ..."
+OFFLINE_BUNDLE="${OFFLINE_BUNDLE:-}"
+if [[ -n "$OFFLINE_BUNDLE" && -f "$OFFLINE_BUNDLE" ]]; then
+  log "Using offline bundle: $OFFLINE_BUNDLE"
+  TMPDIR="$(mktemp -d)"
+  tar -C "$TMPDIR" -xzf "$OFFLINE_BUNDLE"
+
+  install -m 0755 "$TMPDIR/k3s" /usr/local/bin/k3s
+
+  mkdir -p /var/lib/rancher/k3s/agent/images
+  cp "$TMPDIR"/k3s-images-*.tar /var/lib/rancher/k3s/agent/images/
+  # import all addon images automatically on first k3s start:
+  cp "$TMPDIR/addons/"*.tar /var/lib/rancher/k3s/agent/images/ 2>/dev/null || true
+
+  # Auto-applied manifests (server-only path; harmless on agents)
+  mkdir -p /var/lib/rancher/k3s/server/manifests
+  cp -r "$TMPDIR/server-manifests/." /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || true
+
+  # Tell the upstream get.k3s.io script to skip downloads (we already staged files)
+  export INSTALL_K3S_SKIP_DOWNLOAD=true
+else
+  log "Offline bundle not provided; will use online install."
+fi
+
 # Basic OS check
 if ! grep -qi 'debian' /etc/os-release || ! grep -q 'VERSION_CODENAME=bookworm' /etc/os-release; then
   warn "This script targets Debian 12 (Bookworm). Continuing anyway."
