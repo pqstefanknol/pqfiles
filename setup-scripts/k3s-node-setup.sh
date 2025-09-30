@@ -173,10 +173,37 @@ apt-get -y install --no-install-recommends \
   curl jq ca-certificates gnupg lvm2 nfs-common open-iscsi chrony conntrack \
   iptables arptables ebtables kmod apt-transport-https
 
-# Optional VM agents (best-effort)
-apt-get -y install open-vm-tools || true
-apt-get -y install qemu-guest-agent || true
-systemctl enable --now qemu-guest-agent || true
+# Optional: install the right guest tools for the detected hypervisor
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+  VIRT="$(systemd-detect-virt || true)"
+  case "$VIRT" in
+    kvm|qemu|bochs|kvm*)   # Proxmox/KVM etc.
+      apt-get -y install qemu-guest-agent || true
+      # On some images the unit has no [Install] section; just start it if present.
+      systemctl start qemu-guest-agent 2>/dev/null || true
+      ;;
+    vmware)
+      apt-get -y install open-vm-tools || true
+      systemctl enable --now open-vm-tools 2>/dev/null || true
+      ;;
+    microsoft)  # Hyper-V
+      apt-get -y install linux-cloud-tools-common linux-cloud-tools-$(uname -r) || true
+      ;;
+    oracle)     # VirtualBox
+      apt-get -y install virtualbox-guest-utils || true
+      ;;
+    *)
+      # Unknown or 'none' (bare metal) — do nothing.
+      :
+      ;;
+  esac
+else
+  # Fallback: try both, best-effort
+  apt-get -y install qemu-guest-agent open-vm-tools || true
+  systemctl start qemu-guest-agent 2>/dev/null || true
+  systemctl enable --now open-vm-tools 2>/dev/null || true
+fi
+
 
 log "Setting hostname and timezone..."
 hostnamectl set-hostname "${HOSTNAME}"
