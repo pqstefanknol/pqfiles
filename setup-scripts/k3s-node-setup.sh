@@ -58,6 +58,20 @@ validate_role() {
 
 non_empty() { [ -n "${1:-}" ]; }
 
+# Build flag arrays cleanly
+add_flag_if_set() { # usage: add_flag_if_set VAR FLAG ARRAY_NAME
+  local var="$1" flag="$2" arr="$3"
+  if [ -n "${!var:-}" ]; then
+    eval "$arr+=(\"$flag\" \"${!var}\")"
+  fi
+}
+add_bool_flag_if_true() { # usage: add_bool_flag_if_true VAR FLAG ARRAY_NAME
+  local var="$1" flag="$2" arr="$3"
+  if [ "${!var:-}" = "true" ]; then
+    eval "$arr+=(\"$flag\")"
+  fi
+}
+
 ################################
 # Arg parsing (just -y/--yes)
 ################################
@@ -235,9 +249,17 @@ EOF
 k3s_install() {
   log "=== K3S INSTALL ==="
 
-  # Collect inputs with safe defaults/prompts
+  # Inputs
   ask "Node role (server/agent)" ROLE "${ROLE:-server}"
   validate_role
+
+  # Optional extras from env:
+  #   NODE_IP=10.0.0.x            (pin advertise IP on multi-NIC)
+  #   API_FQDN=cluster.example.com (extra TLS SAN)
+  #   DISABLE_TRAEFIK=true|false   (default true)
+  #   DISABLE_SERVICELB=true|false (default true)
+  DISABLE_TRAEFIK="${DISABLE_TRAEFIK:-true}"
+  DISABLE_SERVICELB="${DISABLE_SERVICELB:-true}"
 
   if [ "${ROLE}" = "server" ]; then
     ask "API VIP (for --tls-san; e.g. 10.0.0.10)" API_VIP "${API_VIP:-}"
@@ -246,47 +268,51 @@ k3s_install() {
       ask "Server URL (e.g. https://${API_VIP:-10.0.0.10}:6443)" SERVER_URL "${SERVER_URL:-}"
       ask "Shared cluster TOKEN" TOKEN "${TOKEN:-}"
     fi
-  else
-    ask "Server URL (e.g. https://10.0.0.10:6443)" SERVER_URL "${SERVER_URL:-}"
-    ask "Shared cluster TOKEN" TOKEN "${TOKEN:-}"
-  fi
 
-  log "Summary:
-  Role:         ${ROLE}
-  K3s version:  ${K3S_VERSION:-(default latest)}
-  API VIP:      ${API_VIP:-n/a}
-  First server: ${CLUSTER_INIT:-n/a}
-  Server URL:   ${SERVER_URL:-n/a}
-  Token set:    $( [ -n "${TOKEN:-}" ] && echo yes || echo no )
+    # Build flags
+    server_flags=(--write-kubeconfig-mode=0644)
+    [ "$DISABLE_TRAEFIK" = "true" ]   && server_flags+=(--disable traefik)
+    [ "$DISABLE_SERVICELB" = "true" ] && server_flags+=(--disable servicelb)
+    add_flag_if_set API_VIP  --tls-san server_flags
+    add_flag_if_set API_FQDN --tls-san server_flags
+    add_flag_if_set NODE_IP  --node-ip  server_flags
+
+    log "Summary:
+    Role:         server
+    K3s version:  ${K3S_VERSION:-(default latest)}
+    API VIP:      ${API_VIP:-n/a}
+    First server: ${CLUSTER_INIT}
+    Server URL:   ${SERVER_URL:-n/a}
+    Token set:    $( [ -n "${TOKEN:-}" ] && echo yes || echo no )
+    Extra SAN:    ${API_FQDN:-n/a}
+    NODE_IP:      ${NODE_IP:-auto}
 "
+    if ! confirm "Proceed with k3s installation?"; then
+      warn "Skipping k3s install."
+      return 0
+    fi
 
-  if ! confirm "Proceed with k3s installation?"; then
-    warn "Skipping k3s install."
-    return 0
-  fi
-
-  log "Preparing /root/cluster.env..."
-  cat >/root/cluster.env <<EOF
+    log "Preparing /root/cluster.env..."
+    cat >/root/cluster.env <<EOF
 # Saved by k3s-node-setup.sh on $(date -Iseconds)
-ROLE=${ROLE}
+ROLE=server
 HOSTNAME=${HOSTNAME:-$(hostname)}
 TZ=${TZ:-$(timedatectl show -p Timezone --value || echo Europe/Amsterdam)}
 K3S_VERSION=${K3S_VERSION:-}
 API_VIP=${API_VIP:-}
+API_FQDN=${API_FQDN:-}
+NODE_IP=${NODE_IP:-}
 CLUSTER_INIT=${CLUSTER_INIT:-}
 SERVER_URL=${SERVER_URL:-}
 TOKEN=${TOKEN:-}
 EOF
-  chmod 600 /root/cluster.env
+    chmod 600 /root/cluster.env
 
-  log "Installing k3s (${ROLE})..."
-  K3S_INSTALL_SH_URL="https://get.k3s.io"
-  export INSTALL_K3S_VERSION="${K3S_VERSION:-}"
-
-  if [ "${ROLE}" = "server" ]; then
-    if [ "${CLUSTER_INIT:-}" = "true" ]; then
-      export INSTALL_K3S_EXEC="server --cluster-init --write-kubeconfig-mode=0644 --disable traefik --tls-san ${API_VIP:-}"
-      curl -sfL "${K3S_INSTALL_SH_URL}" | sh -s -
+    # Do the install (single place)
+    K3S_INSTALL_SH_URL="https://get.k3s.io"
+    export INSTALL_K3S_VERSION="${K3S_VERSION:-}"
+    if [ "${CLUSTER_INIT}" = "true" ]; then
+      export INSTALL_K3S_EXEC="server --cluster-init ${server_flags[*]}"
     else
       if ! non_empty "${SERVER_URL:-}" || ! non_empty "${TOKEN:-}"; then
         err "SERVER_URL and TOKEN are required to join a server."
@@ -294,25 +320,64 @@ EOF
       fi
       export K3S_URL="${SERVER_URL}"
       export K3S_TOKEN="${TOKEN}"
-      export INSTALL_K3S_EXEC="server --write-kubeconfig-mode=0644 --disable traefik --tls-san ${API_VIP:-}"
-      curl -sfL "${K3S_INSTALL_SH_URL}" | sh -s -
+      export INSTALL_K3S_EXEC="server ${server_flags[*]}"
     fi
+    curl -sfL "${K3S_INSTALL_SH_URL}" | sh -s -
     systemctl enable --now k3s
+
   else
+    # agent
+    ask "Server URL (e.g. https://10.0.0.10:6443)" SERVER_URL "${SERVER_URL:-}"
+    ask "Shared cluster TOKEN" TOKEN "${TOKEN:-}"
+
+    agent_flags=()
+    add_flag_if_set NODE_IP --node-ip agent_flags
+
+    log "Summary:
+    Role:         agent
+    K3s version:  ${K3S_VERSION:-(default latest)}
+    Server URL:   ${SERVER_URL}
+    Token set:    $( [ -n "${TOKEN:-}" ] && echo yes || echo no )
+    NODE_IP:      ${NODE_IP:-auto}
+"
+    if ! confirm "Proceed with k3s installation?"; then
+      warn "Skipping k3s install."
+      return 0
+    fi
+
+    log "Preparing /root/cluster.env..."
+    cat >/root/cluster.env <<EOF
+# Saved by k3s-node-setup.sh on $(date -Iseconds)
+ROLE=agent
+HOSTNAME=${HOSTNAME:-$(hostname)}
+TZ=${TZ:-$(timedatectl show -p Timezone --value || echo Europe/Amsterdam)}
+K3S_VERSION=${K3S_VERSION:-}
+NODE_IP=${NODE_IP:-}
+SERVER_URL=${SERVER_URL:-}
+TOKEN=${TOKEN:-}
+EOF
+    chmod 600 /root/cluster.env
+
+    K3S_INSTALL_SH_URL="https://get.k3s.io"
+    export INSTALL_K3S_VERSION="${K3S_VERSION:-}"
     if ! non_empty "${SERVER_URL:-}" || ! non_empty "${TOKEN:-}"; then
       err "SERVER_URL and TOKEN are required for agent."
       exit 1
     fi
     export K3S_URL="${SERVER_URL}"
     export K3S_TOKEN="${TOKEN}"
-    curl -sfL "${K3S_INSTALL_SH_URL}" | K3S_URL="${K3S_URL}" K3S_TOKEN="${K3S_TOKEN}" sh -s - agent
+    export INSTALL_K3S_EXEC="agent ${agent_flags[*]}"
+    curl -sfL "${K3S_INSTALL_SH_URL}" | sh -s -
     systemctl enable --now k3s-agent
   fi
 
-  log "k3s installed. Kubectl: /usr/local/bin/kubectl (symlink to k3s kubectl)"
+  log "k3s installed. Kubectl: /usr/local/bin/kubectl (symlink via k3s)"
   if [ "${ROLE}" = "server" ]; then
     log "Kubeconfig: /etc/rancher/k3s/k3s.yaml"
-    log "Tip: mkdir -p ~/.kube && sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config && sudo chown $SUDO_USER:$SUDO_USER ~/.kube/config"
+    dest_user="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+    dest_home="$(getent passwd "$dest_user" | cut -d: -f6)"
+    [ -z "$dest_home" ] && dest_home="/root"
+    log "Tip: mkdir -p ${dest_home}/.kube && sudo cp /etc/rancher/k3s/k3s.yaml ${dest_home}/.kube/config && sudo chown ${dest_user}:${dest_user} ${dest_home}/.kube/config"
   fi
 
   cat <<'EONOTE'
@@ -383,6 +448,9 @@ template_prep() {
   apt-get -y autoremove --purge || true
   apt-get -y clean || true
   rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+
+  # Fresh entropy seed; will be recreated on next boot
+  rm -f /var/lib/systemd/random-seed 2>/dev/null || true
 
   # Cloud-init not used here, but if present, clean it
   if dpkg -s cloud-init >/dev/null 2>&1; then
