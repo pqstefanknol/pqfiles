@@ -23,19 +23,6 @@ warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
 err()  { printf "\033[1;31m[ERR ]\033[0m %s\n" "$*" >&2; }
 trap 'err "Failed at line $LINENO"; exit 1' ERR
 
-ask() {
-  local prompt="$1" var="$2" def="${3:-}"
-  if [ "${ASSUME_YES:-false}" = "true" ]; then
-    eval "export $var=\"\${$var:-$def}\""
-    return
-  fi
-  local current; current="$(eval "printf '%s' \"\${$var:-}\"")"
-  local show="${current:-$def}"
-  read -rp "$prompt [${show}]: " ans || true
-  ans="${ans:-$show}"
-  eval "export $var=\"$ans\""
-}
-
 need_root() {
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     err "Please run as root (sudo -i)."
@@ -49,13 +36,6 @@ confirm() {
   [[ "${_c,,}" =~ ^y(es)?$ ]]
 }
 
-validate_role() {
-  case "${ROLE:-}" in
-    server|agent) ;;
-    *) err "ROLE must be 'server' or 'agent'"; exit 2;;
-  esac
-}
-
 non_empty() { [ -n "${1:-}" ]; }
 
 # Build flag arrays cleanly
@@ -65,31 +45,56 @@ add_flag_if_set() { # usage: add_flag_if_set VAR FLAG ARRAY_NAME
     eval "$arr+=(\"$flag\" \"${!var}\")"
   fi
 }
-add_bool_flag_if_true() { # usage: add_bool_flag_if_true VAR FLAG ARRAY_NAME
-  local var="$1" flag="$2" arr="$3"
-  if [ "${!var:-}" = "true" ]; then
-    eval "$arr+=(\"$flag\")"
-  fi
-}
 
-parse_bool() {
-  local s="${1,,}"
-  [[ "$s" =~ ^(y|yes|true|1)$ ]]
-}
+# Value prompt (with optional validation list)
+ask_value() { # ask_value "Prompt" VAR default_value [valid_values...]
+  local prompt="$1" var="$2" def="${3:-}" val
+  shift 3
+  local valid_values=("$@")
 
-ask_bool() { # ask_bool "Prompt" VAR default_bool
-  local prompt="$1" var="$2" def="${3:-false}"
   if [ "${ASSUME_YES:-false}" = "true" ]; then
-    eval "export $var=$def"; return
+    val="${!var:-$def}"
+    eval "export $var=\"$val\""
+    return
   fi
-  local show=$([ "$def" = "true" ] && echo "yes" || echo "no")
+
+  local current; current="$(eval "printf '%s' \"\${$var:-}\"")"
+  local show="${current:-$def}"
+
+  if [ ${#valid_values[@]} -gt 0 ]; then
+    local options="[${valid_values[*]}]"
+    read -rp "$prompt $options [${show}]: " ans || true
+    ans="${ans:-$show}"
+
+    local valid=false
+    for valid_value in "${valid_values[@]}"; do
+      if [ "$ans" = "$valid_value" ]; then
+        valid=true
+        break
+      fi
+    done
+    if [ "$valid" = "false" ]; then
+      echo "Invalid value. Must be one of: ${valid_values[*]}"
+      ask_value "$prompt" "$var" "$def" "${valid_values[@]}"
+      return
+    fi
+  else
+    read -rp "$prompt [${show}]: " ans || true
+    ans="${ans:-$show}"
+  fi
+
+  eval "export $var=\"$ans\""
+}
+
+# yes/no helper (default=no unless ASSUME_YES true)
+parse_bool() { local s="${1,,}"; [[ "$s" =~ ^(y|yes|true|1)$ ]]; }
+ask_bool() {
+  local prompt="$1" var="$2" def="${3:-false}" show ans
+  [ "${ASSUME_YES:-false}" = "true" ] && { eval "export $var=$def"; return; }
+  show=$([ "$def" = "true" ] && echo "yes" || echo "no")
   read -rp "$prompt [${show}]: " ans || true
   ans="${ans:-$show}"
-  if parse_bool "$ans"; then
-    eval "export $var=true"
-  else
-    eval "export $var=false"
-  fi
+  if parse_bool "$ans"; then eval "export $var=true"; else eval "export $var=false"; fi
 }
 
 ################################
@@ -119,6 +124,8 @@ Environment:
   CLUSTER_INIT=true|false         (true on first server)
   SERVER_URL=https://<VIP>:6443   (joiners/agents)
   TOKEN=<cluster token>           (joiners/agents)
+  NODE_IP=<ip>                    (optional, pin advertise IP)
+  API_FQDN=<dns>                  (optional, extra TLS SAN)
 
   # k3s offline bundle
   OFFLINE_BUNDLE=/root/k3s-offline-...tar.gz
@@ -139,10 +146,27 @@ done
 ################################
 need_root
 
+# Record whether PHASE was provided by env, then set defaults
+if [ -z "${PHASE+x}" ]; then PHASE_ENV_SET=false; else PHASE_ENV_SET=true; fi
 PHASE="${PHASE:-base}"               # base | k3s | all
 TEMPLATE_PREP="${TEMPLATE_PREP:-false}"
 
-# OS guardrail
+# Conflict guard: TEMPLATE_PREP + PHASE=k3s/all is not allowed
+if [ "${TEMPLATE_PREP,,}" = "true" ] && [ "${PHASE}" != "base" ]; then
+  if [ "${ASSUME_YES:-false}" = "true" ]; then
+    err "TEMPLATE_PREP=true conflicts with PHASE=${PHASE}. Use PHASE=base or unset TEMPLATE_PREP."
+    exit 2
+  else
+    warn "TEMPLATE_PREP=true conflicts with PHASE=${PHASE}."
+    if confirm "Switch to PHASE=base and run template prep only?"; then
+      PHASE="base"
+    else
+      TEMPLATE_PREP="false"
+    fi
+  fi
+fi
+
+# OS guardrail (Debian 12/13)
 if [ -r /etc/os-release ]; then
   . /etc/os-release
   if [ "${ID,,}" != "debian" ] || { [ "$VERSION_CODENAME" != "bookworm" ] && [ "$VERSION_CODENAME" != "trixie" ]; }; then
@@ -151,7 +175,6 @@ if [ -r /etc/os-release ]; then
 else
   warn "/etc/os-release not found; proceeding cautiously."
 fi
-
 
 ################################
 # OFFLINE k3s bundle (if supplied)
@@ -176,8 +199,8 @@ fi
 base_prep() {
   log "=== BASE PREP ==="
 
-  ask "Hostname to set" HOSTNAME "$(hostname)"
-  ask "Timezone" TZ "${TZ:-Europe/Amsterdam}"
+  ask_value "Hostname to set" HOSTNAME "$(hostname)"
+  ask_value "Timezone" TZ "${TZ:-Europe/Amsterdam}"
 
   log "Updating packages & installing prerequisites..."
   export DEBIAN_FRONTEND=noninteractive
@@ -260,10 +283,12 @@ EOF
 
   log "BASE PREP complete."
 
-  if [ -z "${PHASE+x}" ]; then
+  # If PHASE wasn't provided via env, offer simple yes/no flow
+  if [ "$PHASE_ENV_SET" = "false" ]; then
     ask_bool "Set this machine up as a reusable template?" TEMPLATE_PREP false
-  else [ "$TEMPLATE_PREP" != "true" ]; then
-    ask_bool "Proceed to install k3s after base prep?" RUN_K3S_AFTER_BASE false
+    if [ "$TEMPLATE_PREP" != "true" ]; then
+      ask_bool "Install k3s after base prep?" RUN_K3S_AFTER_BASE false
+    fi
   fi
 }
 
@@ -274,8 +299,7 @@ k3s_install() {
   log "=== K3S INSTALL ==="
 
   # Inputs
-  ask "Node role (server/agent)" ROLE "${ROLE:-server}"
-  validate_role
+  ask_value "Node role (server/agent)" ROLE "server" "server" "agent"
 
   # Optional extras from env:
   #   NODE_IP=10.0.0.x            (pin advertise IP on multi-NIC)
@@ -286,11 +310,11 @@ k3s_install() {
   DISABLE_SERVICELB="${DISABLE_SERVICELB:-true}"
 
   if [ "${ROLE}" = "server" ]; then
-    ask "API VIP (for --tls-san; e.g. 10.0.0.10)" API_VIP "${API_VIP:-}"
-    ask "Is this the first server? (true/false)" CLUSTER_INIT "${CLUSTER_INIT:-true}"
+    ask_value "API VIP (for --tls-san; e.g. 10.0.0.10)" API_VIP "${API_VIP:-}"
+    ask_value "Is this the first server? (true/false)" CLUSTER_INIT "true" "true" "false"
     if [ "${CLUSTER_INIT}" != "true" ]; then
-      ask "Server URL (e.g. https://${API_VIP:-10.0.0.10}:6443)" SERVER_URL "${SERVER_URL:-}"
-      ask "Shared cluster TOKEN" TOKEN "${TOKEN:-}"
+      ask_value "Server URL (e.g. https://${API_VIP:-10.0.0.10}:6443)" SERVER_URL "${SERVER_URL:-}"
+      ask_value "Shared cluster TOKEN" TOKEN "${TOKEN:-}"
     fi
 
     # Build flags
@@ -351,8 +375,8 @@ EOF
 
   else
     # agent
-    ask "Server URL (e.g. https://10.0.0.10:6443)" SERVER_URL "${SERVER_URL:-}"
-    ask "Shared cluster TOKEN" TOKEN "${TOKEN:-}"
+    ask_value "Server URL (e.g. https://10.0.0.10:6443)" SERVER_URL "${SERVER_URL:-}"
+    ask_value "Shared cluster TOKEN" TOKEN "${TOKEN:-}"
 
     agent_flags=()
     add_flag_if_set NODE_IP --node-ip agent_flags
@@ -518,9 +542,14 @@ case "$PHASE" in
     ;;
 esac
 
-# Optional generalization
-if [ "$TEMPLATE_PREP" = "true" ]; then
+# Optional generalization (runs after the selected phase)
+if [ "${TEMPLATE_PREP,,}" = "true" ]; then
   template_prep
+fi
+
+# Optional follow-on after base-only run
+if [ "${RUN_K3S_AFTER_BASE:-false}" = "true" ] && [ "$PHASE" = "base" ] && [ "${TEMPLATE_PREP,,}" != "true" ]; then
+  k3s_install
 fi
 
 log "Done."
