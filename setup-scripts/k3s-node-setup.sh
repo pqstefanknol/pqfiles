@@ -109,8 +109,8 @@ PHASE="${PHASE:-base}"               # base | k3s | all
 TEMPLATE_PREP="${TEMPLATE_PREP:-false}"
 
 # OS guardrail
-if ! grep -qi 'debian' /etc/os-release || ! grep -q 'VERSION_CODENAME=bookworm' /etc/os-release; then
-  warn "This script targets Debian 12 (Bookworm). Continuing anyway."
+if ! grep -qi 'debian' /etc/os-release || ! grep -q 'VERSION_CODENAME=bookworm' /etc/os-release || ! grep -q 'VERSION_CODENAME=trixie' /etc/os-release; then
+  warn "This script targets Debian 12 (Bookworm) or Debian 13 (Trixie). Continuing anyway."
 fi
 
 ################################
