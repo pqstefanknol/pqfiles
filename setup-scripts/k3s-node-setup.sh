@@ -23,6 +23,11 @@ warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
 err()  { printf "\033[1;31m[ERR ]\033[0m %s\n" "$*" >&2; }
 trap 'err "Failed at line $LINENO"; exit 1' ERR
 
+# Offline knobs (safe defaults)
+OFFLINE_MODE="${OFFLINE_MODE:-false}"   # true|false
+MANIFESTS_DIR="${MANIFESTS_DIR:-/opt/manifests}"
+IMAGES_DIR="${IMAGES_DIR:-/var/lib/rancher/k3s/agent/images}"
+
 need_root() {
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     err "Please run as root (sudo -i)."
@@ -120,10 +125,24 @@ ensure_db_creds() {
   log "DB creds ready (user=${POSTGRES_USER}, db=${POSTGRES_DB}). Password stored in env only."
 }
 
+# Ensure airgap image tarballs are present when offline
+require_airgap_images() {
+  if [ "${OFFLINE_MODE}" = "true" ]; then
+    if ! ls "${IMAGES_DIR}"/*.tar >/dev/null 2>&1; then
+      err "OFFLINE_MODE=true but no image tarballs found in ${IMAGES_DIR}.
+Place all required *.tar images there (k3s will auto-import on start)."
+      exit 1
+    fi
+    log "Offline images detected in ${IMAGES_DIR}."
+  fi
+}
+
 ################################
 # Installers
 ################################
 install_helm() {
+  # In strict offline mode you either use pre-rendered manifests or local chart archives.
+  [ "${OFFLINE_MODE}" = "true" ] && return 0
   if ! command -v helm >/dev/null 2>&1; then
     log "Installing Helm..."
     curl -fsSL https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
@@ -135,16 +154,23 @@ install_helm() {
 # Set EXTERNAL_TLS=false to run plain HTTP only (no TLS listener).
 install_ingress_nginx() {
   local ns="ingress-nginx"
-  local EXTERNAL_HTTPS_PORT="${EXTERNAL_HTTPS_PORT:-443}"
-  local EXTERNAL_HTTP_PORT="${EXTERNAL_HTTP_PORT:-80}"
-  local EXTERNAL_TLS="${EXTERNAL_TLS:-true}"   # true|false
-
   kubectl create ns "$ns" 2>/dev/null || true
+
+  if [ "${OFFLINE_MODE}" = "true" ]; then
+    if [ -d "${MANIFESTS_DIR}/ingress-nginx" ]; then
+      log "Applying offline ingress-nginx manifests from ${MANIFESTS_DIR}/ingress-nginx ..."
+      kubectl -n "${ns}" apply -f "${MANIFESTS_DIR}/ingress-nginx/"
+      log "ingress-nginx ready (offline). External ports remain whatever you rendered."
+      return 0
+    else
+      err "OFFLINE_MODE=true but ${MANIFESTS_DIR}/ingress-nginx not found."
+    fi
+  fi
+
   install_helm
   helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null
   helm repo update >/dev/null
 
-  # Base args: DaemonSet + hostPorts + ClusterIP service (no extra IPs)
   local ARGS=(
     --set controller.kind=DaemonSet
     --set controller.hostNetwork=false
@@ -153,35 +179,43 @@ install_ingress_nginx() {
     --set controller.metrics.enabled=true
   )
 
-  # HTTP port (optional)
-  if [ "${EXTERNAL_HTTP_PORT}" != "off" ]; then
-    ARGS+=(--set controller.hostPort.http="${EXTERNAL_HTTP_PORT}")
-  else
-    # disable HTTP listener entirely
+  # HTTP off/on
+  if [ "${EXTERNAL_HTTP_PORT:-off}" = "off" ]; then
     ARGS+=(--set controller.enableHttp=false)
+  else
+    ARGS+=(--set controller.hostPort.http="${EXTERNAL_HTTP_PORT:-80}")
   fi
 
-  # HTTPS / TLS listener
-  if [ "${EXTERNAL_TLS}" = "true" ]; then
-    ARGS+=(--set controller.hostPort.https="${EXTERNAL_HTTPS_PORT}")
+  # HTTPS off/on
+  if [ "${EXTERNAL_TLS:-true}" = "true" ]; then
+    ARGS+=(--set controller.hostPort.https="${EXTERNAL_HTTPS_PORT:-443}")
   else
-    # disable HTTPS; serve plain HTTP only
     ARGS+=(--set controller.enableHttps=false)
   fi
 
   helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n "$ns" "${ARGS[@]}"
-  log "ingress-nginx ready. External ports -> HTTP:${EXTERNAL_HTTP_PORT:-off} HTTPS:${EXTERNAL_TLS:+$EXTERNAL_HTTPS_PORT}"
-  log "Ingress still routes to Service on port 3001 inside the cluster."
 }
+
+
 
 install_longhorn() {
   log "Installing Longhorn (replicated PVs)..."
   kubectl create ns longhorn-system 2>/dev/null || true
-  install_helm
-  helm repo add longhorn https://charts.longhorn.io >/dev/null
-  helm repo update >/dev/null
-  helm upgrade --install longhorn longhorn/longhorn -n longhorn-system
-  log "Longhorn installed. Ensure open-iscsi is running (script already enabled it)."
+  
+  if [ "${OFFLINE_MODE}" = "true" ]; then
+    if [ -d "${MANIFESTS_DIR}/longhorn" ]; then
+      log "Applying offline Longhorn manifests from ${MANIFESTS_DIR}/longhorn ..."
+      kubectl -n longhorn-system apply -f "${MANIFESTS_DIR}/longhorn/"
+    else
+      err "OFFLINE_MODE=true but ${MANIFESTS_DIR}/longhorn not found."
+    fi
+  else
+    install_helm
+    helm repo add longhorn https://charts.longhorn.io >/dev/null
+    helm repo update >/dev/null
+    helm upgrade --install longhorn longhorn/longhorn -n longhorn-system
+    log "Longhorn installed. Ensure open-iscsi is running (script already enabled it)."
+  fi
 }
 
 install_timescaledb_ha() {
@@ -190,27 +224,34 @@ install_timescaledb_ha() {
   log "Installing TimescaleDB-HA (Patroni-backed) into namespace: $ns"
 
   kubectl create ns "$ns" 2>/dev/null || true
-  install_helm
-  helm repo add timescale https://charts.timescale.com >/dev/null
-  helm repo update >/dev/null
-
-  # Ensure creds exist (and exported) before install
   ensure_db_creds
+  
+  if [ "${OFFLINE_MODE}" = "true" ]; then
+    if [ -d "${MANIFESTS_DIR}/timescaledb" ]; then
+      log "Applying offline TimescaleDB manifests from ${MANIFESTS_DIR}/timescaledb ..."
+      kubectl -n "$ns" apply -f "${MANIFESTS_DIR}/timescaledb/"
+    else
+      err "OFFLINE_MODE=true but ${MANIFESTS_DIR}/timescaledb not found."
+    fi
+  else
+    install_helm
+    helm repo add timescale https://charts.timescale.com >/dev/null
+    helm repo update >/dev/null
 
-  helm upgrade --install tsdb timescale/timescaledb-single -n "$ns" \
-    --set replicaCount=3 \
-    --set storageClass="$sc" \
-    --set volumePermissions.enabled=true \
-    --set resources.requests.cpu=500m \
-    --set resources.requests.memory=1Gi \
-    --set credentials.username="${POSTGRES_USER}" \
-    --set credentials.password="${POSTGRES_PASSWORD}" \
-    --set credentials.database="${POSTGRES_DB}"
-
-  # Optional: create extension at init (if your chart supports it via initdbScripts)
-  # kubectl -n "$ns" create configmap tsdb-init --from-literal init.sql='CREATE EXTENSION IF NOT EXISTS timescaledb;' \
-  #   --dry-run=client -o yaml | kubectl apply -f -
-  # and then add: --set initdbScriptsConfigMap=tsdb-init
+    helm upgrade --install tsdb timescale/timescaledb-single -n "$ns" \
+      --set replicaCount=3 \
+      --set storageClass="$sc" \
+      --set volumePermissions.enabled=true \
+      --set resources.requests.cpu=500m \
+      --set resources.requests.memory=1Gi \
+      --set credentials.username="${POSTGRES_USER}" \
+      --set credentials.password="${POSTGRES_PASSWORD}" \
+      --set credentials.database="${POSTGRES_DB}"
+  fi
+    # Optional: create extension at init (if your chart supports it via initdbScripts)
+    # kubectl -n "$ns" create configmap tsdb-init --from-literal init.sql='CREATE EXTENSION IF NOT EXISTS timescaledb;' \
+    #   --dry-run=client -o yaml | kubectl apply -f -
+    # and then add: --set initdbScriptsConfigMap=tsdb-init
 }
 
 install_redis_sentinel() {
@@ -218,24 +259,34 @@ install_redis_sentinel() {
   local sc="${2:-longhorn}"
 
   kubectl create ns "$ns" 2>/dev/null || true
-  install_helm
-  helm repo add bitnami https://charts.bitnami.com/bitnami >/dev/null
-  helm repo update >/dev/null
-
-  REDIS_PASSWORD="${REDIS_PASSWORD:-$(openssl rand -base64 32 | tr -d '\n' | cut -c1-32)}"
-
-  helm upgrade --install redis bitnami/redis -n "$ns" \
-    --set architecture=replication \
-    --set replica.replicaCount=2 \
-    --set sentinel.enabled=true \
-    --set sentinel.usePassword=true \
-    --set sentinel.masterSet=mymaster \
-    --set auth.password="${REDIS_PASSWORD}" \
-    --set master.persistence.size=10Gi \
-    --set replica.persistence.size=10Gi \
-    --set master.persistence.storageClass="$sc" \
-    --set replica.persistence.storageClass="$sc"
-
+  
+  if [ "${OFFLINE_MODE}" = "true" ]; then
+    if [ -d "${MANIFESTS_DIR}/redis" ]; then
+      log "Applying offline Redis (Sentinel) manifests from ${MANIFESTS_DIR}/redis ..."
+      kubectl -n "$ns" apply -f "${MANIFESTS_DIR}/redis/"
+    else
+      err "OFFLINE_MODE=true but ${MANIFESTS_DIR}/redis not found."
+    fi
+  else
+    install_helm
+    helm repo add bitnami https://charts.bitnami.com/bitnami >/dev/null
+    helm repo update >/dev/null
+    
+    REDIS_PASSWORD="${REDIS_PASSWORD:-$(openssl rand -base64 32 | tr -d '\n' | cut -c1-32)}"
+    
+    helm upgrade --install redis bitnami/redis -n "$ns" \
+      --set architecture=replication \
+      --set replica.replicaCount=2 \
+      --set sentinel.enabled=true \
+      --set sentinel.usePassword=true \
+      --set sentinel.masterSet=mymaster \
+      --set auth.password="${REDIS_PASSWORD}" \
+      --set master.persistence.size=10Gi \
+      --set replica.persistence.size=10Gi \
+      --set master.persistence.storageClass="$sc" \
+      --set replica.persistence.storageClass="$sc"
+  fi
+  
   log "Redis (Sentinel) installed with password; master: redis-master.${ns}.svc.cluster.local, sentinel: redis.${ns}.svc.cluster.local:26379"
 }
 
@@ -576,6 +627,8 @@ EOF
 ################################
 k3s_install() {
   log "=== K3S INSTALL ==="
+  require_airgap_images
+  ...
 
   # Inputs
   ask_value "Node role (server/agent)" ROLE "server" "server" "agent"
@@ -637,8 +690,26 @@ EOF
 
     # Do the install (single place)
     K3S_INSTALL_SH_URL="https://get.k3s.io"
-    export INSTALL_K3S_VERSION="${K3S_VERSION:-}"
-        # --- kube-vip API VIP (first server only) ---
+    K3S_INSTALL_LOCAL="${K3S_INSTALL_LOCAL:-/opt/k3s/install.sh}"
+
+    if [ "${OFFLINE_MODE}" = "true" ]; then
+      if [ ! -x /usr/local/bin/k3s ]; then
+        err "OFFLINE_MODE=true but /usr/local/bin/k3s not present. Pre-bake the k3s binary."
+      fi
+      if [ -f "$K3S_INSTALL_LOCAL" ]; then
+        log "Using local k3s installer: $K3S_INSTALL_LOCAL"
+        export INSTALL_K3S_VERSION="${K3S_VERSION:-}"
+        # when the binary is already present, this avoids downloads:
+        export INSTALL_K3S_SKIP_DOWNLOAD=true
+        sh "$K3S_INSTALL_LOCAL"
+      else
+        err "OFFLINE_MODE=true but no local installer at $K3S_INSTALL_LOCAL. Save get.k3s.io to that path in your template."
+      fi
+    else
+      export INSTALL_K3S_VERSION="${K3S_VERSION:-}"
+      curl -sfL "${K3S_INSTALL_SH_URL}" | sh -s -
+    fi
+
     # --- kube-vip API VIP (first server only) ---
     if [ "${CLUSTER_INIT}" = "true" ]; then
       if ! non_empty "${API_VIP:-}"; then
