@@ -97,6 +97,32 @@ ask_bool() {
   if parse_bool "$ans"; then eval "export $var=true"; else eval "export $var=false"; fi
 }
 
+# Read a token without echoing input (for ENDPOINT_TOKEN)
+ask_secret() {
+  local prompt="$1" var="$2" def="${3:-}"
+  if [ "${ASSUME_YES:-false}" = "true" ] && [ -n "${!var:-}" ]; then return; fi
+  local current; current="$(eval "printf '%s' \"\${$var:-}\"")"
+  local show="${current:-$def}"
+  read -rsp "$prompt [hidden, Enter to keep default${show:+: $show}]: " ans || true
+  echo
+  ans="${ans:-$show}"
+  eval "export $var=\"$ans\""
+}
+
+gen_hex()  { openssl rand -hex 32; }             # 64 hex chars
+gen_pass() { openssl rand -base64 32 | tr -d '\n' | cut -c1-32; }
+
+gen_hex()  { openssl rand -hex 32; }             # 64 hex chars
+gen_pass() { openssl rand -base64 32 | tr -d '\n' | cut -c1-32; }
+
+ensure_db_creds() {
+  POSTGRES_USER="${POSTGRES_USER:-bns_admin}"
+  POSTGRES_DB="${POSTGRES_DB:-bns}"
+  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(gen_pass)}"
+  export POSTGRES_USER POSTGRES_DB POSTGRES_PASSWORD
+  log "DB creds ready (user=${POSTGRES_USER}, db=${POSTGRES_DB}). Password stored in env only."
+}
+
 ################################
 # Installers
 ################################
@@ -163,18 +189,31 @@ install_longhorn() {
 
 install_timescaledb_ha() {
   local ns="${1:-data}"
-  local sc="${2:-longhorn}"   # or leave blank to use cluster default
+  local sc="${2:-longhorn}"
   log "Installing TimescaleDB-HA (Patroni-backed) into namespace: $ns"
+
   kubectl create ns "$ns" 2>/dev/null || true
   install_helm
   helm repo add timescale https://charts.timescale.com >/dev/null
   helm repo update >/dev/null
+
+  # Ensure creds exist (and exported) before install
+  ensure_db_creds
+
   helm upgrade --install tsdb timescale/timescaledb-single -n "$ns" \
-  --set replicaCount=3 \
-  --set storageClass="$sc" \
-  --set volumePermissions.enabled=true \
-  --set resources.requests.cpu=500m \
-  --set resources.requests.memory=1Gi
+    --set replicaCount=3 \
+    --set storageClass="$sc" \
+    --set volumePermissions.enabled=true \
+    --set resources.requests.cpu=500m \
+    --set resources.requests.memory=1Gi \
+    --set credentials.username="${POSTGRES_USER}" \
+    --set credentials.password="${POSTGRES_PASSWORD}" \
+    --set credentials.database="${POSTGRES_DB}"
+
+  # Optional: create extension at init (if your chart supports it via initdbScripts)
+  # kubectl -n "$ns" create configmap tsdb-init --from-literal init.sql='CREATE EXTENSION IF NOT EXISTS timescaledb;' \
+  #   --dry-run=client -o yaml | kubectl apply -f -
+  # and then add: --set initdbScriptsConfigMap=tsdb-init
 }
 
 install_redis_sentinel() {
@@ -203,28 +242,13 @@ install_redis_sentinel() {
   log "Redis (Sentinel) installed with password; master: redis-master.${ns}.svc.cluster.local, sentinel: redis.${ns}.svc.cluster.local:26379"
 }
 
-# Read a token without echoing input (for ENDPOINT_TOKEN)
-ask_secret() {
-  local prompt="$1" var="$2" def="${3:-}"
-  if [ "${ASSUME_YES:-false}" = "true" ] && [ -n "${!var:-}" ]; then return; fi
-  local current; current="$(eval "printf '%s' \"\${$var:-}\"")"
-  local show="${current:-$def}"
-  read -rsp "$prompt [hidden, Enter to keep default${show:+: $show}]: " ans || true
-  echo
-  ans="${ans:-$show}"
-  eval "export $var=\"$ans\""
-}
-
-gen_hex()  { openssl rand -hex 32; }             # 64 hex chars
-gen_pass() { openssl rand -base64 32 | tr -d '\n' | cut -c1-32; }
-
 apply_bns_minimal_config() {
   local ns="blueraven-network-server"
   kubectl create ns "$ns" 2>/dev/null || true
 
   # ----- generated secrets -----
   API_TOKEN="${API_TOKEN:-$(gen_hex)}"
-  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(gen_pass)}"
+  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(gen_pass)}"  # will keep existing from ensure_db_creds
   REDIS_PASSWORD="${REDIS_PASSWORD:-$(gen_pass)}"
 
   # Provided during install
@@ -762,6 +786,7 @@ EOF
     install_ingress_nginx
 
     install_longhorn
+    ensure_db_creds
     install_timescaledb_ha data longhorn
     install_redis_sentinel  data longhorn
 
