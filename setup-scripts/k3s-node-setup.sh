@@ -112,15 +112,15 @@ install_redis_sentinel() {
 }
 
 deploy_blueraven_sample() {
-  log "Deploying BlueRaven sample manifests..."
-  kubectl create ns blueraven 2>/dev/null || true
+  log "Deploying BlueRaven Network Server sample manifests..."
+  kubectl create ns blueraven-network-server 2>/dev/null || true
 
   cat <<'YAML' | kubectl apply -f -
 apiVersion: v1
 kind: Secret
 metadata:
   name: app-secrets
-  namespace: blueraven
+  namespace: blueraven-network-server
 type: Opaque
 stringData:
   DATABASE_URL: "postgresql://user:pass@tsdb-timescaledb.data.svc.cluster.local:5432/db"
@@ -130,51 +130,51 @@ stringData:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: blueraven
-  namespace: blueraven
+  name: blueraven-network-server
+  namespace: blueraven-network-server
 spec:
   replicas: 3
-  selector: { matchLabels: { app: blueraven } }
+  selector: { matchLabels: { app: blueraven-network-server } }
   template:
-    metadata: { labels: { app: blueraven } }
+    metadata: { labels: { app: blueraven-network-server } }
     spec:
       containers:
       - name: app
-        image: ghcr.io/yourorg/blueraven:latest
-        ports: [{containerPort: 8080}]
+        image: docker.allroundcustoms.nl/blueraven-network-server:latest
+        ports: [{containerPort: 3002}]
         envFrom:
         - secretRef: { name: app-secrets }
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: blueraven
-  namespace: blueraven
+  name: blueraven-network-server
+  namespace: blueraven-network-server
 spec:
-  selector: { app: blueraven }
-  ports: [{ port: 80, targetPort: 8080 }]
+  selector: { app: blueraven-network-server }
+  ports: [{ port: 3001, targetPort: 3002 }]
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: blueraven
-  namespace: blueraven
+  name: blueraven-network-server
+  namespace: blueraven-network-server
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
 spec:
   ingressClassName: nginx
   rules:
-  - host: blueraven.localtest.me
+  - host: blueraven-network-server.localtest.me
     http:
       paths:
       - path: /
         pathType: Prefix
         backend:
           service:
-            name: blueraven
-            port: { number: 80 }
+            name: blueraven-network-server
+            port: { number: 3001 }
 YAML
-  log "BlueRaven sample deployed. Open http://<any-node-ip>/ (or use the host in the Ingress)."
+  log "BlueRaven Network server sample deployed. Open http://<any-node-ip>/ (or use the host in the Ingress)."
 }
 
 # Value prompt (with optional validation list)
