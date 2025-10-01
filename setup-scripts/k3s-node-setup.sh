@@ -208,6 +208,11 @@ net.netfilter.nf_conntrack_max = 524288
 EOF
   sysctl --system
 
+  # Reboot hint when kernel or core libs updated
+  if [ -f /var/run/reboot-required ]; then
+    warn "A reboot is required (kernel or core packages updated). Consider rebooting before installing k3s."
+  fi
+
   log "Enable iSCSI (Longhorn prerequisite)..."
   systemctl enable --now iscsid
 
@@ -383,6 +388,20 @@ template_prep() {
   if dpkg -s cloud-init >/dev/null 2>&1; then
     cloud-init clean --logs || true
   fi
+
+  cat >/etc/systemd/system/ssh-regenerate-keys.service <<'EOF'
+[Unit]
+Description=Regenerate SSH host keys if missing
+ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl enable ssh-regenerate-keys.service
 
   log "Template prep complete. Shutdown and convert this VM into a template/clone."
 }
