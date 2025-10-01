@@ -46,137 +46,6 @@ add_flag_if_set() { # usage: add_flag_if_set VAR FLAG ARRAY_NAME
   fi
 }
 
-install_helm() {
-  if ! command -v helm >/dev/null 2>&1; then
-    log "Installing Helm..."
-    curl -fsSL https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
-  fi
-}
-
-install_ingress_nginx_hostports() {
-  log "Installing ingress-nginx (DaemonSet + hostNetwork/hostPorts)..."
-  kubectl create ns ingress-nginx 2>/dev/null || true
-  install_helm
-  helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null
-  helm repo update >/dev/null
-  helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx \
-    --set controller.kind=DaemonSet \
-    --set controller.hostNetwork=true \
-    --set controller.daemonset.useHostPort=true \
-    --set controller.service.type=ClusterIP \
-    --set controller.metrics.enabled=true
-  log "ingress-nginx ready. Point DNS A for your app to the three node IPs (round-robin)."
-}
-
-install_longhorn() {
-  log "Installing Longhorn (replicated PVs)..."
-  kubectl create ns longhorn-system 2>/dev/null || true
-  install_helm
-  helm repo add longhorn https://charts.longhorn.io >/dev/null
-  helm repo update >/dev/null
-  helm upgrade --install longhorn longhorn/longhorn -n longhorn-system
-  log "Longhorn installed. Ensure open-iscsi is running (script already enabled it)."
-}
-
-install_timescaledb_ha() {
-  local ns="${1:-data}"
-  local sc="${2:-longhorn}"   # or leave blank to use cluster default
-  log "Installing TimescaleDB-HA (Patroni-backed) into namespace: $ns"
-  kubectl create ns "$ns" 2>/dev/null || true
-  install_helm
-  helm repo add timescale https://charts.timescale.com >/dev/null
-  helm repo update >/dev/null
-  helm upgrade --install tsdb timescale/timescaledb-single -n "$ns" \
-    --set replicaCount=3 \
-    --set storageClass="$sc" \
-    --set resources.requests.cpu=500m \
-    --set resources.requests.memory=1Gi
-}
-
-install_redis_sentinel() {
-  local ns="${1:-data}"
-  local sc="${2:-longhorn}"
-  log "Installing Redis (replication + Sentinel) into namespace: $ns"
-  kubectl create ns "$ns" 2>/dev/null || true
-  install_helm
-  helm repo add bitnami https://charts.bitnami.com/bitnami >/dev/null
-  helm repo update >/dev/null
-  helm upgrade --install redis bitnami/redis -n "$ns" \
-    --set architecture=replication \
-    --set sentinel.enabled=true \
-    --set replica.replicaCount=2 \
-    --set master.persistence.size=10Gi \
-    --set replica.persistence.size=10Gi \
-    --set master.persistence.storageClass="$sc" \
-    --set replica.persistence.storageClass="$sc"
-}
-
-deploy_blueraven_sample() {
-  log "Deploying BlueRaven Network Server sample manifests..."
-  kubectl create ns blueraven-network-server 2>/dev/null || true
-
-  cat <<'YAML' | kubectl apply -f -
-apiVersion: v1
-kind: Secret
-metadata:
-  name: app-secrets
-  namespace: blueraven-network-server
-type: Opaque
-stringData:
-  DATABASE_URL: "postgresql://user:pass@tsdb-timescaledb.data.svc.cluster.local:5432/db"
-  REDIS_SENTINEL: "redis://redis.data.svc.cluster.local:26379"
-  REDIS_MASTER_SET: "mymaster"
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: blueraven-network-server
-  namespace: blueraven-network-server
-spec:
-  replicas: 3
-  selector: { matchLabels: { app: blueraven-network-server } }
-  template:
-    metadata: { labels: { app: blueraven-network-server } }
-    spec:
-      containers:
-      - name: app
-        image: docker.allroundcustoms.nl/blueraven-network-server:latest
-        ports: [{containerPort: 3002}]
-        envFrom:
-        - secretRef: { name: app-secrets }
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: blueraven-network-server
-  namespace: blueraven-network-server
-spec:
-  selector: { app: blueraven-network-server }
-  ports: [{ port: 3001, targetPort: 3002 }]
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: blueraven-network-server
-  namespace: blueraven-network-server
-  annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "0"
-spec:
-  ingressClassName: nginx
-  rules:
-  - host: blueraven-network-server.localtest.me
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: blueraven-network-server
-            port: { number: 3001 }
-YAML
-  log "BlueRaven Network server sample deployed. Open http://<any-node-ip>/ (or use the host in the Ingress)."
-}
-
 # Value prompt (with optional validation list)
 ask_value() { # ask_value "Prompt" VAR default_value [valid_values...]
   local prompt="$1" var="$2" def="${3:-}" val
@@ -227,6 +96,264 @@ ask_bool() {
   ans="${ans:-$show}"
   if parse_bool "$ans"; then eval "export $var=true"; else eval "export $var=false"; fi
 }
+
+################################
+# Installers
+################################
+install_helm() {
+  if ! command -v helm >/dev/null 2>&1; then
+    log "Installing Helm..."
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+  fi
+}
+
+# Install/upgrade ingress-nginx and bind external ports via hostPorts.
+# EXTERNAL_HTTPS_PORT defaults to 443; EXTERNAL_HTTP_PORT defaults to 80.
+# Set EXTERNAL_TLS=false to run plain HTTP only (no TLS listener).
+install_ingress_nginx() {
+  local ns="ingress-nginx"
+  local EXTERNAL_HTTPS_PORT="${EXTERNAL_HTTPS_PORT:-443}"
+  local EXTERNAL_HTTP_PORT="${EXTERNAL_HTTP_PORT:-80}"
+  local EXTERNAL_TLS="${EXTERNAL_TLS:-true}"   # true|false
+
+  kubectl create ns "$ns" 2>/dev/null || true
+  install_helm
+  helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null
+  helm repo update >/dev/null
+
+  # Base args: DaemonSet + hostPorts + ClusterIP service (no extra IPs)
+  local ARGS=(
+    --set controller.kind=DaemonSet
+    --set controller.hostNetwork=false
+    --set controller.hostPort.enabled=true
+    --set controller.service.type=ClusterIP
+    --set controller.metrics.enabled=true
+  )
+
+  # HTTP port (optional)
+  if [ "${EXTERNAL_HTTP_PORT}" != "off" ]; then
+    ARGS+=(--set controller.hostPort.http="${EXTERNAL_HTTP_PORT}")
+  else
+    # disable HTTP listener entirely
+    ARGS+=(--set controller.enableHttp=false)
+  fi
+
+  # HTTPS / TLS listener
+  if [ "${EXTERNAL_TLS}" = "true" ]; then
+    ARGS+=(--set controller.hostPort.https="${EXTERNAL_HTTPS_PORT}")
+  else
+    # disable HTTPS; serve plain HTTP only
+    ARGS+=(--set controller.enableHttps=false)
+  fi
+
+  helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n "$ns" "${ARGS[@]}"
+  log "ingress-nginx ready. External ports -> HTTP:${EXTERNAL_HTTP_PORT:-off} HTTPS:${EXTERNAL_TLS:+$EXTERNAL_HTTPS_PORT}"
+  log "Ingress still routes to Service on port 3001 inside the cluster."
+}
+
+install_longhorn() {
+  log "Installing Longhorn (replicated PVs)..."
+  kubectl create ns longhorn-system 2>/dev/null || true
+  install_helm
+  helm repo add longhorn https://charts.longhorn.io >/dev/null
+  helm repo update >/dev/null
+  helm upgrade --install longhorn longhorn/longhorn -n longhorn-system
+  log "Longhorn installed. Ensure open-iscsi is running (script already enabled it)."
+}
+
+install_timescaledb_ha() {
+  local ns="${1:-data}"
+  local sc="${2:-longhorn}"   # or leave blank to use cluster default
+  log "Installing TimescaleDB-HA (Patroni-backed) into namespace: $ns"
+  kubectl create ns "$ns" 2>/dev/null || true
+  install_helm
+  helm repo add timescale https://charts.timescale.com >/dev/null
+  helm repo update >/dev/null
+  helm upgrade --install tsdb timescale/timescaledb-single -n "$ns" \
+  --set replicaCount=3 \
+  --set storageClass="$sc" \
+  --set volumePermissions.enabled=true \
+  --set resources.requests.cpu=500m \
+  --set resources.requests.memory=1Gi
+}
+
+install_redis_sentinel() {
+  local ns="${1:-data}"
+  local sc="${2:-longhorn}"
+
+  kubectl create ns "$ns" 2>/dev/null || true
+  install_helm
+  helm repo add bitnami https://charts.bitnami.com/bitnami >/dev/null
+  helm repo update >/dev/null
+
+  REDIS_PASSWORD="${REDIS_PASSWORD:-$(openssl rand -base64 32 | tr -d '\n' | cut -c1-32)}"
+
+  helm upgrade --install redis bitnami/redis -n "$ns" \
+    --set architecture=replication \
+    --set replica.replicaCount=2 \
+    --set sentinel.enabled=true \
+    --set sentinel.usePassword=true \
+    --set sentinel.masterSet=mymaster \
+    --set auth.password="${REDIS_PASSWORD}" \
+    --set master.persistence.size=10Gi \
+    --set replica.persistence.size=10Gi \
+    --set master.persistence.storageClass="$sc" \
+    --set replica.persistence.storageClass="$sc"
+
+  log "Redis (Sentinel) installed with password; master: redis-master.${ns}.svc.cluster.local, sentinel: redis.${ns}.svc.cluster.local:26379"
+}
+
+# Read a token without echoing input (for ENDPOINT_TOKEN)
+ask_secret() {
+  local prompt="$1" var="$2" def="${3:-}"
+  if [ "${ASSUME_YES:-false}" = "true" ] && [ -n "${!var:-}" ]; then return; fi
+  local current; current="$(eval "printf '%s' \"\${$var:-}\"")"
+  local show="${current:-$def}"
+  read -rsp "$prompt [hidden, Enter to keep default${show:+: $show}]: " ans || true
+  echo
+  ans="${ans:-$show}"
+  eval "export $var=\"$ans\""
+}
+
+gen_hex()  { openssl rand -hex 32; }             # 64 hex chars
+gen_pass() { openssl rand -base64 32 | tr -d '\n' | cut -c1-32; }
+
+apply_bns_minimal_config() {
+  local ns="blueraven-network-server"
+  kubectl create ns "$ns" 2>/dev/null || true
+
+  # ----- generated secrets -----
+  API_TOKEN="${API_TOKEN:-$(gen_hex)}"
+  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(gen_pass)}"
+  REDIS_PASSWORD="${REDIS_PASSWORD:-$(gen_pass)}"
+
+  # Provided during install
+  ask_secret "Enter ENDPOINT_TOKEN (from BlueRaven)" ENDPOINT_TOKEN "${ENDPOINT_TOKEN:-}"
+
+  # ----- Redis mode: USE_SENTINEL=true|false (default true). If REDIS_URL set, it overrides both. -----
+  USE_SENTINEL="${USE_SENTINEL:-true}"
+  REDIS_URL="${REDIS_URL:-}"
+
+  # Base app (HTTP behind ingress; set SSL_PORT=3001 so the app won’t do TLS itself)
+  cat >/tmp/bns-app.env <<'CFG'
+PORT=3001
+SSL_PORT=3001
+POSTGRES_HOST=tsdb-timescaledb.data.svc.cluster.local
+POSTGRES_PORT=5432
+POSTGRES_USER=bns_admin
+POSTGRES_DB=bns
+BNS_NAME=BNS
+VERSION=5.0.0
+CFG
+
+  if [ -n "$REDIS_URL" ]; then
+    # C) URL-driven override
+    cat >>/tmp/bns-app.env <<CFG
+REDIS_URL=${REDIS_URL}
+CFG
+  elif [ "${USE_SENTINEL,,}" = "true" ]; then
+    # B) Sentinel-aware (default)
+    cat >>/tmp/bns-app.env <<'CFG'
+REDIS_SENTINEL=true
+REDIS_MASTER_SET=mymaster
+# Single Kubernetes headless name works; Sentinel picks up all pods
+REDIS_SENTINELS=redis.data.svc.cluster.local:26379
+CFG
+  else
+    # A) Simple, not Sentinel-aware
+    cat >>/tmp/bns-app.env <<'CFG'
+REDIS_SENTINEL=false
+REDIS_HOST=redis-master.data.svc.cluster.local
+REDIS_PORT=6379
+CFG
+  fi
+
+  kubectl -n "$ns" create configmap bns-config \
+    --from-env-file=/tmp/bns-app.env \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+  cat >/tmp/bns-secrets.env <<SEC
+API_TOKEN=${API_TOKEN}
+ENDPOINT_TOKEN=${ENDPOINT_TOKEN}
+POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+REDIS_PASSWORD=${REDIS_PASSWORD}
+SEC
+
+  kubectl -n "$ns" create secret generic bns-secrets \
+    --from-env-file=/tmp/bns-secrets.env \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+  rm -f /tmp/bns-app.env /tmp/bns-secrets.env
+
+  log "BNS minimal ConfigMap/Secret applied (ns: $ns)."
+  log "Generated API_TOKEN, POSTGRES_PASSWORD, REDIS_PASSWORD."
+}
+
+deploy_blueraven() {
+  local ns="blueraven-network-server"
+  log "Deploying BlueRaven Network Server (minimal prod) ..."
+  kubectl create ns "$ns" 2>/dev/null || true
+
+  cat <<'YAML' | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blueraven-network-server
+  namespace: blueraven-network-server
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: blueraven-network-server }
+  template:
+    metadata:
+      labels: { app: blueraven-network-server }
+    spec:
+      containers:
+      - name: app
+        image: docker.allroundcustoms.nl/blueraven-network-server:latest
+        ports:
+        - containerPort: 3001
+        envFrom:
+        - configMapRef: { name: bns-config }
+        - secretRef:    { name: bns-secrets }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blueraven-network-server
+  namespace: blueraven-network-server
+spec:
+  selector: { app: blueraven-network-server }
+  ports:
+  - name: http
+    port: 3001
+    targetPort: 3001
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: blueraven-network-server
+  namespace: blueraven-network-server
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: blueraven-network-server.localtest.me
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: blueraven-network-server
+            port: { number: 3001 }
+YAML
+
+  log "BlueRaven deployed. Browse https://blueraven-network-server.localtest.me (TLS at ingress)."
+}
+
+
 
 ################################
 # Arg parsing (just -y/--yes)
@@ -465,7 +592,7 @@ k3s_install() {
     Token set:    $( [ -n "${TOKEN:-}" ] && echo yes || echo no )
     Extra SAN:    ${API_FQDN:-n/a}
     NODE_IP:      ${NODE_IP:-auto}
-"
+    "
     if ! confirm "Proceed with k3s installation?"; then
       warn "Skipping k3s install."
       return 0
@@ -491,6 +618,7 @@ EOF
     K3S_INSTALL_SH_URL="https://get.k3s.io"
     export INSTALL_K3S_VERSION="${K3S_VERSION:-}"
         # --- kube-vip API VIP (first server only) ---
+    # --- kube-vip API VIP (first server only) ---
     if [ "${CLUSTER_INIT}" = "true" ]; then
       if ! non_empty "${API_VIP:-}"; then
         err "API_VIP is required for first server (kube-vip)."
@@ -502,7 +630,6 @@ EOF
       mkdir -p /var/lib/rancher/k3s/server/manifests
 
       log "Installing kube-vip RBAC/DaemonSet (VIP: ${API_VIP}, IFACE: ${IFACE})..."
-      # RBAC
       curl -fsSL https://kube-vip.io/manifests/rbac.yaml \
         -o /var/lib/rancher/k3s/server/manifests/kube-vip-rbac.yaml
 
@@ -527,8 +654,16 @@ spec:
       - key: "node-role.kubernetes.io/control-plane"
         operator: "Exists"
         effect: "NoSchedule"
-      nodeSelector:
-        node-role.kubernetes.io/control-plane: "true"
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
       containers:
       - name: kube-vip
         image: ghcr.io/kube-vip/kube-vip:${KUBE_VIP_VER}
@@ -548,7 +683,7 @@ spec:
           capabilities:
             add: ["NET_ADMIN","NET_RAW"]
 EOF
-      fi
+
       export INSTALL_K3S_EXEC="server --cluster-init ${server_flags[*]}"
     else
       if ! non_empty "${SERVER_URL:-}" || ! non_empty "${TOKEN:-}"; then
@@ -559,6 +694,7 @@ EOF
       export K3S_TOKEN="${TOKEN}"
       export INSTALL_K3S_EXEC="server ${server_flags[*]}"
     fi
+
     curl -sfL "${K3S_INSTALL_SH_URL}" | sh -s -
     systemctl enable --now k3s
 
@@ -616,19 +752,28 @@ EOF
     [ -z "$dest_home" ] && dest_home="/root"
     log "Tip: mkdir -p ${dest_home}/.kube && sudo cp /etc/rancher/k3s/k3s.yaml ${dest_home}/.kube/config && sudo chown ${dest_user}:${dest_user} ${dest_home}/.kube/config"
   fi
-  
+
   if [ "${ROLE}" = "server" ] && [ "${CLUSTER_INIT}" = "true" ]; then
-    install_ingress_nginx_hostports
+
+    ask_value "External HTTPS port to expose (e.g. 443 or 8443)" EXTERNAL_HTTPS_PORT "8443"
+    EXTERNAL_HTTP_PORT="${EXTERNAL_HTTP_PORT:-off}" \
+    EXTERNAL_HTTPS_PORT="${EXTERNAL_HTTPS_PORT}" \
+    EXTERNAL_TLS="${EXTERNAL_TLS:-true}" \
+    install_ingress_nginx
+
     install_longhorn
     install_timescaledb_ha data longhorn
     install_redis_sentinel  data longhorn
-    deploy_blueraven_sample
+
+    # Generate + apply minimal BNS env (tokens/passwords), then deploy
+    apply_bns_minimal_config
+    deploy_blueraven
   fi
 
   cat <<'EONOTE'
 
 Next steps (HA control-plane):
-1) First server (if not done):
+1) First server (if not done (should be at this point)):
      sudo ROLE=server CLUSTER_INIT=true ./k3s-node-setup.sh --yes PHASE=k3s
    Get join token:
      sudo cat /var/lib/rancher/k3s/server/node-token
@@ -640,7 +785,7 @@ Next steps (HA control-plane):
      sudo ROLE=agent SERVER_URL=https://<API-VIP>:6443 TOKEN=<token> ./k3s-node-setup.sh --yes PHASE=k3s
 
 VIP/Ingress:
-- kube-vip provides the API VIP; ingress-nginx uses hostPorts 80/443 on each node (no extra IPs).”
+- kube-vip provides the API VIP; ingress-nginx binds your chosen hostPorts on each node (e.g., HTTPS on ${EXTERNAL_HTTPS_PORT}, HTTP ${EXTERNAL_HTTP_PORT:-off}) — no extra IPs.
 
 Storage:
 - Longhorn requires iSCSI (already enabled). Consider a dedicated disk at /var/lib/longhorn.
