@@ -72,6 +72,26 @@ add_bool_flag_if_true() { # usage: add_bool_flag_if_true VAR FLAG ARRAY_NAME
   fi
 }
 
+parse_bool() {
+  local s="${1,,}"
+  [[ "$s" =~ ^(y|yes|true|1)$ ]]
+}
+
+ask_bool() { # ask_bool "Prompt" VAR default_bool
+  local prompt="$1" var="$2" def="${3:-false}"
+  if [ "${ASSUME_YES:-false}" = "true" ]; then
+    eval "export $var=$def"; return
+  fi
+  local show=$([ "$def" = "true" ] && echo "yes" || echo "no")
+  read -rp "$prompt [${show}]: " ans || true
+  ans="${ans:-$show}"
+  if parse_bool "$ans"; then
+    eval "export $var=true"
+  else
+    eval "export $var=false"
+  fi
+}
+
 ################################
 # Arg parsing (just -y/--yes)
 ################################
