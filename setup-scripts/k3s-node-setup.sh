@@ -109,9 +109,15 @@ PHASE="${PHASE:-base}"               # base | k3s | all
 TEMPLATE_PREP="${TEMPLATE_PREP:-false}"
 
 # OS guardrail
-if ! grep -qi 'debian' /etc/os-release || ! grep -q 'VERSION_CODENAME=bookworm' /etc/os-release || ! grep -q 'VERSION_CODENAME=trixie' /etc/os-release; then
-  warn "This script targets Debian 12 (Bookworm) or Debian 13 (Trixie). Continuing anyway."
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  if [ "${ID,,}" != "debian" ] || { [ "$VERSION_CODENAME" != "bookworm" ] && [ "$VERSION_CODENAME" != "trixie" ]; }; then
+    warn "This script targets Debian 12 (Bookworm) or Debian 13 (Trixie). Continuing anyway."
+  fi
+else
+  warn "/etc/os-release not found; proceeding cautiously."
 fi
+
 
 ################################
 # OFFLINE k3s bundle (if supplied)
