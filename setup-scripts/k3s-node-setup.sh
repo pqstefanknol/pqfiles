@@ -240,7 +240,11 @@ EOF
 
   log "BASE PREP complete."
 
-  ask "Do you want to set this up as a template? (true/false)" TEMPLATE_PREP "${TEMPLATE_PREP:-false}"
+  if [ -z "${PHASE+x}" ]; then
+    ask_bool "Set this machine up as a reusable template?" TEMPLATE_PREP false
+  else [ "$TEMPLATE_PREP" != "true" ]; then
+    ask_bool "Proceed to install k3s after base prep?" RUN_K3S_AFTER_BASE false
+  fi
 }
 
 ################################
