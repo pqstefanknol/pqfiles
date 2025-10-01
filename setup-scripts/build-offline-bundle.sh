@@ -125,7 +125,7 @@ for f in "${MANIFESTS_DIR}"/**/*.yaml; do
   collect_images "$f" >> "${IMAGELIST}" || true
 done
 # + You likely also need the BlueRaven app image:
-echo "docker.allroundcustoms.nl/blueraven-network-server:latest" >> "${IMAGELIST}"
+echo "docker.allroundcustoms.nl/blueraven-network-server:v5.0.2" >> "${IMAGELIST}"
 
 # De-duplicate and normalize
 sort -u -o "${IMAGELIST}" "${IMAGELIST}"
