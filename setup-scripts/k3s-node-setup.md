@@ -1,5 +1,8 @@
 **Prepare a reusable VM (no cluster config yet):**
 
+Download the script # wget -O k3s-node-setup.sh https://raw.githubusercontent.com/pqstefanknol/pqfiles/main/setup-scripts/k3s-node-setup.sh 
+Make it executable # chmod +x k3s-node-setup.sh 
+Run interactively # sudo ./k3s-node-setup.sh
 ```
 PHASE=base ASSUME_YES=true HOSTNAME=brn-base TZ=Europe/Amsterdam sudo -E ./k3s-node-setup.sh
 TEMPLATE_PREP=true ASSUME_YES=true sudo -E ./k3s-node-setup.sh
