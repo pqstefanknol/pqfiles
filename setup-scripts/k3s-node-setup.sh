@@ -46,6 +46,137 @@ add_flag_if_set() { # usage: add_flag_if_set VAR FLAG ARRAY_NAME
   fi
 }
 
+install_helm() {
+  if ! command -v helm >/dev/null 2>&1; then
+    log "Installing Helm..."
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+  fi
+}
+
+install_ingress_nginx_hostports() {
+  log "Installing ingress-nginx (DaemonSet + hostNetwork/hostPorts)..."
+  kubectl create ns ingress-nginx 2>/dev/null || true
+  install_helm
+  helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null
+  helm repo update >/dev/null
+  helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx \
+    --set controller.kind=DaemonSet \
+    --set controller.hostNetwork=true \
+    --set controller.daemonset.useHostPort=true \
+    --set controller.service.type=ClusterIP \
+    --set controller.metrics.enabled=true
+  log "ingress-nginx ready. Point DNS A for your app to the three node IPs (round-robin)."
+}
+
+install_longhorn() {
+  log "Installing Longhorn (replicated PVs)..."
+  kubectl create ns longhorn-system 2>/dev/null || true
+  install_helm
+  helm repo add longhorn https://charts.longhorn.io >/dev/null
+  helm repo update >/dev/null
+  helm upgrade --install longhorn longhorn/longhorn -n longhorn-system
+  log "Longhorn installed. Ensure open-iscsi is running (script already enabled it)."
+}
+
+install_timescaledb_ha() {
+  local ns="${1:-data}"
+  local sc="${2:-longhorn}"   # or leave blank to use cluster default
+  log "Installing TimescaleDB-HA (Patroni-backed) into namespace: $ns"
+  kubectl create ns "$ns" 2>/dev/null || true
+  install_helm
+  helm repo add timescale https://charts.timescale.com >/dev/null
+  helm repo update >/dev/null
+  helm upgrade --install tsdb timescale/timescaledb-single -n "$ns" \
+    --set replicaCount=3 \
+    --set storageClass="$sc" \
+    --set resources.requests.cpu=500m \
+    --set resources.requests.memory=1Gi
+}
+
+install_redis_sentinel() {
+  local ns="${1:-data}"
+  local sc="${2:-longhorn}"
+  log "Installing Redis (replication + Sentinel) into namespace: $ns"
+  kubectl create ns "$ns" 2>/dev/null || true
+  install_helm
+  helm repo add bitnami https://charts.bitnami.com/bitnami >/dev/null
+  helm repo update >/dev/null
+  helm upgrade --install redis bitnami/redis -n "$ns" \
+    --set architecture=replication \
+    --set sentinel.enabled=true \
+    --set replica.replicaCount=2 \
+    --set master.persistence.size=10Gi \
+    --set replica.persistence.size=10Gi \
+    --set master.persistence.storageClass="$sc" \
+    --set replica.persistence.storageClass="$sc"
+}
+
+deploy_blueraven_sample() {
+  log "Deploying BlueRaven sample manifests..."
+  kubectl create ns blueraven 2>/dev/null || true
+
+  cat <<'YAML' | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+  namespace: blueraven
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql://user:pass@tsdb-timescaledb.data.svc.cluster.local:5432/db"
+  REDIS_SENTINEL: "redis://redis.data.svc.cluster.local:26379"
+  REDIS_MASTER_SET: "mymaster"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blueraven
+  namespace: blueraven
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: blueraven } }
+  template:
+    metadata: { labels: { app: blueraven } }
+    spec:
+      containers:
+      - name: app
+        image: ghcr.io/yourorg/blueraven:latest
+        ports: [{containerPort: 8080}]
+        envFrom:
+        - secretRef: { name: app-secrets }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blueraven
+  namespace: blueraven
+spec:
+  selector: { app: blueraven }
+  ports: [{ port: 80, targetPort: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: blueraven
+  namespace: blueraven
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: blueraven.localtest.me
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: blueraven
+            port: { number: 80 }
+YAML
+  log "BlueRaven sample deployed. Open http://<any-node-ip>/ (or use the host in the Ingress)."
+}
+
 # Value prompt (with optional validation list)
 ask_value() { # ask_value "Prompt" VAR default_value [valid_values...]
   local prompt="$1" var="$2" def="${3:-}" val
@@ -359,7 +490,65 @@ EOF
     # Do the install (single place)
     K3S_INSTALL_SH_URL="https://get.k3s.io"
     export INSTALL_K3S_VERSION="${K3S_VERSION:-}"
+        # --- kube-vip API VIP (first server only) ---
     if [ "${CLUSTER_INIT}" = "true" ]; then
+      if ! non_empty "${API_VIP:-}"; then
+        err "API_VIP is required for first server (kube-vip)."
+        exit 1
+      fi
+
+      KUBE_VIP_VER="${KUBE_VIP_VER:-v0.8.7}"
+      IFACE="${IFACE:-$(ip -o -4 route show to default | awk '{print $5}' | head -n1)}"
+      mkdir -p /var/lib/rancher/k3s/server/manifests
+
+      log "Installing kube-vip RBAC/DaemonSet (VIP: ${API_VIP}, IFACE: ${IFACE})..."
+      # RBAC
+      curl -fsSL https://kube-vip.io/manifests/rbac.yaml \
+        -o /var/lib/rancher/k3s/server/manifests/kube-vip-rbac.yaml
+
+      # DaemonSet (control-plane VIP only; no Service LBs)
+      cat >/var/lib/rancher/k3s/server/manifests/kube-vip-ds.yaml <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-vip
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-vip
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-vip
+    spec:
+      hostNetwork: true
+      tolerations:
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: kube-vip
+        image: ghcr.io/kube-vip/kube-vip:${KUBE_VIP_VER}
+        args: ["manager"]
+        env:
+        - name: vip_arp
+          value: "true"
+        - name: address
+          value: "${API_VIP}"
+        - name: interface
+          value: "${IFACE}"
+        - name: cp_enable
+          value: "true"
+        - name: svc_enable
+          value: "false"
+        securityContext:
+          capabilities:
+            add: ["NET_ADMIN","NET_RAW"]
+EOF
+      fi
       export INSTALL_K3S_EXEC="server --cluster-init ${server_flags[*]}"
     else
       if ! non_empty "${SERVER_URL:-}" || ! non_empty "${TOKEN:-}"; then
@@ -427,6 +616,14 @@ EOF
     [ -z "$dest_home" ] && dest_home="/root"
     log "Tip: mkdir -p ${dest_home}/.kube && sudo cp /etc/rancher/k3s/k3s.yaml ${dest_home}/.kube/config && sudo chown ${dest_user}:${dest_user} ${dest_home}/.kube/config"
   fi
+  
+  if [ "${ROLE}" = "server" ] && [ "${CLUSTER_INIT}" = "true" ]; then
+    install_ingress_nginx_hostports
+    install_longhorn
+    install_timescaledb_ha data longhorn
+    install_redis_sentinel  data longhorn
+    deploy_blueraven_sample
+  fi
 
   cat <<'EONOTE'
 
@@ -443,8 +640,7 @@ Next steps (HA control-plane):
      sudo ROLE=agent SERVER_URL=https://<API-VIP>:6443 TOKEN=<token> ./k3s-node-setup.sh --yes PHASE=k3s
 
 VIP/Ingress:
-- Prefer kube-vip (static pod, ARP) for API VIP.
-- Install MetalLB for Service LoadBalancers.
+- kube-vip provides the API VIP; ingress-nginx uses hostPorts 80/443 on each node (no extra IPs).”
 
 Storage:
 - Longhorn requires iSCSI (already enabled). Consider a dedicated disk at /var/lib/longhorn.
