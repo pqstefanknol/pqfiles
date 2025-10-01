@@ -112,9 +112,6 @@ ask_secret() {
 gen_hex()  { openssl rand -hex 32; }             # 64 hex chars
 gen_pass() { openssl rand -base64 32 | tr -d '\n' | cut -c1-32; }
 
-gen_hex()  { openssl rand -hex 32; }             # 64 hex chars
-gen_pass() { openssl rand -base64 32 | tr -d '\n' | cut -c1-32; }
-
 ensure_db_creds() {
   POSTGRES_USER="${POSTGRES_USER:-bns_admin}"
   POSTGRES_DB="${POSTGRES_DB:-bns}"
@@ -334,7 +331,7 @@ spec:
     spec:
       containers:
       - name: app
-        image: docker.allroundcustoms.nl/blueraven-network-server:latest
+        image: blueraven-network-server:<version>
         ports:
         - containerPort: 3001
         envFrom:
@@ -795,7 +792,7 @@ EOF
     deploy_blueraven
   fi
 
-  cat <<'EONOTE'
+  cat <<EONOTE
 
 Next steps (HA control-plane):
 1) First server (if not done (should be at this point)):
