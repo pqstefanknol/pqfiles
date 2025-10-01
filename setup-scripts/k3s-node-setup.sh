@@ -220,6 +220,8 @@ EOF
   chmod 600 /root/base.env
 
   log "BASE PREP complete."
+
+  ask "Do you want to set this up as a template? (true/false)" TEMPLATE_PREP "${TEMPLATE_PREP:-false}"
 }
 
 ################################
